@@ -3,6 +3,10 @@ import SwiftUI
 @Observable
 final class PromptModel {
     var isVisible = false
+    /// Whether the shell has dropped away from the top edge to its resting spot. Animated
+    /// separately from `isVisible` so the shape is never wider than the notch while floating
+    /// partway down (which reads as a detached notch with a gap above it).
+    var isDetached = false
     var deviceName = "AirPods"
     var isConnecting = false
     /// Set once the user presses anywhere on the pill; stops the auto-dismiss.
@@ -61,10 +65,12 @@ struct AudioPromptView: View {
         let visible = model.isVisible
         // With Reduce Motion the pill never morphs or moves; it just fades in place.
         let atRest = visible || model.reduceMotion
+        let detached = model.isDetached || model.reduceMotion
         let size = atRest ? Self.contentSize : collapsedSize
         let full = 28.8 * k
-        // Native shape: its corner radii animate with everything else on the same spring.
-        let top: CGFloat = atRest ? full : (model.hasNotch ? 0 : 9 * k)
+        // Size + bottom corners follow `isVisible`; position + top corners follow `isDetached`,
+        // so the top stays square while attached to the screen edge and rounds as it drops.
+        let top: CGFloat = detached ? full : (model.hasNotch ? 0 : 9 * k)
         let bottom: CGFloat = atRest ? full : (model.hasNotch ? 10 : 9 * k)
         let shape = UnevenRoundedRectangle(topLeadingRadius: top, bottomLeadingRadius: bottom,
                                            bottomTrailingRadius: bottom, topTrailingRadius: top,
@@ -90,7 +96,7 @@ struct AudioPromptView: View {
         // Same as boring.notch: black @ 0.7, radius 6, no offset; clear when closed.
         .shadow(color: .black.opacity(visible ? 0.7 : 0), radius: 6)
         // Drops from the notch / top edge to its resting spot as it grows.
-        .offset(y: atRest ? model.topInset + Self.topGap : 0)
+        .offset(y: detached ? model.topInset + Self.topGap : 0)
         .opacity(model.reduceMotion && !visible ? 0 : 1)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }

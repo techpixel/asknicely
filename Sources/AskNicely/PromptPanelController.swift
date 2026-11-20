@@ -39,10 +39,18 @@ final class PromptPanelController {
         panel.orderFrontRegardless()
         // Flip on the next runloop tick so SwiftUI animates the slide-in.
         DispatchQueue.main.async {
-            // Apple's built-in snappy spring with a touch of bounce (Dynamic Island-like).
-            withAnimation(self.model.reduceMotion ? .easeInOut(duration: 0.2) : .snappy(duration: 0.5, extraBounce: 0.1)) {
-                self.model.isVisible = true
+            if self.model.reduceMotion {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    self.model.isVisible = true
+                    self.model.isDetached = true
+                }
+                return
             }
+            // Grow out of the notch while still attached to the top edge (Apple's snappy spring
+            // with a touch of bounce, Dynamic Island-like)...
+            withAnimation(.snappy(duration: 0.5, extraBounce: 0.1)) { self.model.isVisible = true }
+            // ...then drop to the resting spot once it's wider than the notch.
+            withAnimation(.snappy(duration: 0.45, extraBounce: 0.1).delay(0.12)) { self.model.isDetached = true }
         }
         // HIG: don't rely on motion alone to communicate. Announce the prompt to VoiceOver users.
         NSAccessibility.post(element: NSApp as Any, notification: .announcementRequested, userInfo: [
@@ -53,11 +61,21 @@ final class PromptPanelController {
 
     func hide() {
         guard model.isVisible else { return }
-        // Morph back into the notch: smooth, no bounce.
-        withAnimation(model.reduceMotion ? .easeInOut(duration: 0.2) : .smooth(duration: 0.4)) { model.isVisible = false }
+        if model.reduceMotion {
+            withAnimation(.easeInOut(duration: 0.2)) {
+                model.isVisible = false
+                model.isDetached = false
+            }
+        } else {
+            // Rise and re-attach to the top edge first, then shrink back into the notch:
+            // smooth, no bounce. Shrinking while still floating would leave a notch-shaped
+            // blob hanging below the menu bar with a gap above it.
+            withAnimation(.smooth(duration: 0.25)) { model.isDetached = false }
+            withAnimation(.smooth(duration: 0.35).delay(0.1)) { model.isVisible = false }
+        }
         let item = DispatchWorkItem { [weak self] in self?.panel.orderOut(nil) }
         hideWorkItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: item)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7, execute: item)
     }
 
     /// Whether the mouse is currently over the pill (screen coordinates, so it works while the
