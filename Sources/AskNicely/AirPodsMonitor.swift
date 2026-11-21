@@ -21,10 +21,14 @@ final class AirPodsMonitor: NSObject, CBCentralManagerDelegate {
         central = CBCentralManager(delegate: self, queue: nil)
     }
 
-    /// A paired, not-yet-connected AirPods that is nearby, if any.
+    /// A paired, not-yet-connected AirPods that is nearby, if any. Returns nil while any AirPods are
+    /// already connected to this Mac: the user has audio sorted, and the BLE sighting can't tell pairs
+    /// apart (the connected pair's own advertisement would otherwise "find" a different paired pair).
     func nearbyCandidate() -> KnownAirPods? {
         guard let last = lastSighting, Date().timeIntervalSince(last) < sightingTTL else { return nil }
-        return pairedAirPods().first { !$0.device.isConnected() }
+        let paired = pairedAirPods()
+        guard !paired.contains(where: { $0.device.isConnected() }) else { return nil }
+        return paired.first { !$0.device.isConnected() }
     }
 
     func pairedAirPods() -> [KnownAirPods] {
