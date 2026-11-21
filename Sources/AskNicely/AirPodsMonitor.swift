@@ -61,8 +61,12 @@ final class AirPodsMonitor: NSObject, CBCentralManagerDelegate {
                         advertisementData: [String: Any],
                         rssi RSSI: NSNumber) {
         // Apple company ID 0x004C, type 0x07 = AirPods "proximity pairing".
+        // Byte 7 is the UTP/status byte; bits 1 (0x02) and 3 (0x08) indicate the
+        // two buds' in-ear sensors (swapped depending on the flip bit), so any
+        // non-zero bit in 0x0A means at least one AirPod is currently in an ear.
         guard let data = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data,
-              data.count >= 3, data[0] == 0x4C, data[1] == 0x00, data[2] == 0x07,
+              data.count >= 8, data[0] == 0x4C, data[1] == 0x00, data[2] == 0x07,
+              (data[7] & 0x0A) != 0,
               RSSI.intValue != 127, RSSI.intValue >= minRSSI
         else { return }
         lastSighting = Date()
