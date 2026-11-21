@@ -97,7 +97,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             shownSeconds = 0
             // Real paired-device name (e.g. "<Name>’s AirPods Pro"); generic fallback for demo mode.
             panel.show(deviceName: candidate?.name ?? "AirPods") { [weak self] in self?.connect(candidate) }
-        } else if !shouldShow, panel.isShowing, !panel.model.isConnected {   // let "Connected" finish on its own
+        } else if !shouldShow, panel.isShowing, !panel.model.isConnecting, !panel.model.isConnected {
+            // Not while connecting or "Connected": the AirPods stop counting as a nearby, unconnected
+            // candidate the moment the link comes up, which would otherwise hide the prompt before
+            // the "Connected" state gets to show. `finishConnect` handles the dismissal instead.
             panel.hide()
         }
         updateHotKey()
@@ -131,7 +134,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         let device = target.device
         DispatchQueue.global().async {
-            let ok = device.openConnection() == kIOReturnSuccess
+            // openConnection can report an error even when the link does come up, so also trust
+            // the device's own connected state.
+            let ok = device.openConnection() == kIOReturnSuccess || device.isConnected()
             // Battery properties populate shortly after the link comes up.
             if ok { Thread.sleep(forTimeInterval: 0.6) }
             let battery = ok ? AirPodsMonitor.batteryPercent(of: device) : nil
@@ -144,7 +149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         dismissedThisSession = true
         guard success else { panel.hide(); return }
         panel.showConnected(batteryPercent: battery)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) { [self] in panel.hide() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) { [self] in panel.hide() }
     }
 }
 
