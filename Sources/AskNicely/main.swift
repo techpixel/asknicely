@@ -97,7 +97,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             shownSeconds = 0
             // Real paired-device name (e.g. "<Name>’s AirPods Pro"); generic fallback for demo mode.
             panel.show(deviceName: candidate?.name ?? "AirPods") { [weak self] in self?.connect(candidate) }
-        } else if !shouldShow, panel.isShowing {
+        } else if !shouldShow, panel.isShowing, !panel.model.isConnected {   // let "Connected" finish on its own
             panel.hide()
         }
         updateHotKey()
@@ -125,19 +125,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.model.isConnecting = true
         guard let target else { // demo mode
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [self] in
-                dismissedThisSession = true
-                panel.hide()
+                finishConnect(success: true, battery: 65)
             }
             return
         }
         let device = target.device
         DispatchQueue.global().async {
-            _ = device.openConnection()
-            DispatchQueue.main.async { [self] in
-                dismissedThisSession = true
-                panel.hide()
-            }
+            let ok = device.openConnection() == kIOReturnSuccess
+            // Battery properties populate shortly after the link comes up.
+            if ok { Thread.sleep(forTimeInterval: 0.6) }
+            let battery = ok ? AirPodsMonitor.batteryPercent(of: device) : nil
+            DispatchQueue.main.async { [self] in finishConnect(success: ok, battery: battery) }
         }
+    }
+
+    /// On success, show "Connected" + battery for a moment, then retract into the notch.
+    private func finishConnect(success: Bool, battery: Int?) {
+        dismissedThisSession = true
+        guard success else { panel.hide(); return }
+        panel.showConnected(batteryPercent: battery)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2.2) { [self] in panel.hide() }
     }
 }
 

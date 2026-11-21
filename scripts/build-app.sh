@@ -10,6 +10,10 @@ APP=build/AskNicely.app
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN/AskNicely" "$APP/Contents/MacOS/"
+# Stamp the actual SDK version into LC_BUILD_VERSION (SwiftPM defaults sdk to minos=14.0),
+# so macOS 26+ enables the native Liquid Glass rendering engine instead of compatibility mode.
+SDK_VER=$(xcrun --show-sdk-version)
+xcrun vtool -set-build-version macos 14.0 "$SDK_VER" -replace -output "$APP/Contents/MacOS/AskNicely" "$APP/Contents/MacOS/AskNicely"
 cp scripts/Info.plist "$APP/Contents/Info.plist"
 cp scripts/icon/AppIcon.icns "$APP/Contents/Resources/"
 cp -R "$BIN"/AskNicely_AskNicely.bundle "$APP/Contents/Resources/"

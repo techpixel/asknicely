@@ -34,6 +34,19 @@ final class AirPodsMonitor: NSObject, CBCentralManagerDelegate {
             .map { KnownAirPods(name: $0.name ?? "AirPods", device: $0) }
     }
 
+    /// Battery level of connected AirPods (the lower of the two buds, or the single value for
+    /// AirPods Max). Read via IOBluetoothDevice's undocumented battery properties, so this
+    /// returns `nil` if they're missing or report 0 (unknown) rather than guessing.
+    static func batteryPercent(of device: IOBluetoothDevice) -> Int? {
+        func read(_ key: String) -> Int? {
+            guard device.responds(to: NSSelectorFromString(key)),
+                  let v = (device.value(forKey: key) as? NSNumber)?.intValue, v > 0 else { return nil }
+            return v
+        }
+        let buds = [read("batteryPercentLeft"), read("batteryPercentRight")].compactMap { $0 }
+        return buds.min() ?? read("batteryPercentSingle")
+    }
+
     // MARK: CBCentralManagerDelegate
 
     func centralManagerDidUpdateState(_ central: CBCentralManager) {

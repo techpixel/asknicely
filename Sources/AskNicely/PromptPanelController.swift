@@ -4,6 +4,32 @@ import SwiftUI
 /// Borderless panel that is allowed to sit over the menu bar / notch area.
 private final class FloatingPanel: NSPanel {
     override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
+
+    // MARK: Active-appearance glass (PRIVATE API)
+    //
+    // macOS draws Liquid Glass flat/opaque in windows without active appearance, and this panel is
+    // never key (by design, so it never steals keyboard focus). There is no public way to force the
+    // active look, so these override NSWindow's private appearance queries to report "active"
+    // without actually becoming key. Undocumented: may stop working or change on any macOS update;
+    // if these selectors disappear the overrides are simply never called (glass falls back to flat).
+    // Pass `--no-active-glass` to disable for comparison.
+    static let forceActiveGlass = !CommandLine.arguments.contains("--no-active-glass")
+
+    @objc func _hasActiveAppearance() -> Bool { Self.forceActiveGlass || isKeyWindow }
+    @objc func _hasActiveAppearanceIgnoringKeyFocus() -> Bool { Self.forceActiveGlass || isKeyWindow }
+    @objc func _hasKeyAppearance() -> Bool { Self.forceActiveGlass || isKeyWindow }
+    @objc func hasKeyAppearance() -> Bool { Self.forceActiveGlass || isKeyWindow }
+
+    /// Whether AppKit still implements the private queries overridden above. If Apple removes or
+    /// renames them, our overrides are never consulted and the glass would render flat, so the
+    /// prompt stays notch-black instead. (Can't detect Apple keeping them but no longer using
+    /// them for glass.)
+    static let canForceActiveGlass: Bool = {
+        guard #available(macOS 26.0, *), forceActiveGlass else { return false }
+        return ["_hasActiveAppearance", "_hasActiveAppearanceIgnoringKeyFocus",
+                "_hasKeyAppearance", "hasKeyAppearance"]
+            .allSatisfy { class_getInstanceMethod(NSWindow.self, NSSelectorFromString($0)) != nil }
+    }()
 }
 
 /// Hosts the prompt in a non-activating floating panel pinned to the top-center of the screen.
@@ -23,7 +49,12 @@ final class PromptPanelController {
         panel.level = .mainMenu + 3   // above the menu bar / notch area
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         panel.isMovableByWindowBackground = false
-        panel.contentView = NSHostingView(rootView: AudioPromptView(model: model))
+        model.glassAvailable = FloatingPanel.canForceActiveGlass
+        let host = NSHostingView(rootView: AudioPromptView(model: model))
+        // Don't let SwiftUI resize the panel to the pill's animating size: AppKit resizes from
+        // the left edge, which makes the centered pill jerk sideways while it morphs.
+        host.sizingOptions = []
+        panel.contentView = host
     }
 
     var isShowing: Bool { model.isVisible }
@@ -32,25 +63,25 @@ final class PromptPanelController {
         hideWorkItem?.cancel()
         model.deviceName = deviceName
         model.isConnecting = false
+        model.isConnected = false
+        model.batteryPercent = nil
         model.wasInteracted = false
         model.reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         model.onConnect = onConnect
         positionPanel()
         panel.orderFrontRegardless()
-        // Flip on the next runloop tick so SwiftUI animates the slide-in.
+        panel.contentView?.layoutSubtreeIfNeeded()
+        CATransaction.flush()
+        // Flip on the next runloop tick so SwiftUI animates the water-droplet morph from the
+        // committed initial layout in one continuous liquid motion.
         DispatchQueue.main.async {
-            if self.model.reduceMotion {
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    self.model.isVisible = true
-                    self.model.isDetached = true
-                }
-                return
+            let anim: Animation = self.model.reduceMotion
+                ? .easeInOut(duration: 0.2)
+                : .spring(response: 0.58, dampingFraction: 0.76)
+            withAnimation(anim) {
+                self.model.isVisible = true
+                self.model.progress = 1.0
             }
-            // Grow out of the notch while still attached to the top edge (Apple's snappy spring
-            // with a touch of bounce, Dynamic Island-like)...
-            withAnimation(.snappy(duration: 0.5, extraBounce: 0.1)) { self.model.isVisible = true }
-            // ...then drop to the resting spot once it's wider than the notch.
-            withAnimation(.snappy(duration: 0.45, extraBounce: 0.1).delay(0.12)) { self.model.isDetached = true }
         }
         // HIG: don't rely on motion alone to communicate. Announce the prompt to VoiceOver users.
         NSAccessibility.post(element: NSApp as Any, notification: .announcementRequested, userInfo: [
@@ -59,23 +90,31 @@ final class PromptPanelController {
         ])
     }
 
+    /// Swap to the "Connected" state (battery ring) in place; the caller hides it afterwards.
+    func showConnected(batteryPercent: Int?) {
+        model.batteryPercent = batteryPercent
+        withAnimation(model.reduceMotion ? .easeInOut(duration: 0.2) : .smooth(duration: 0.3)) {
+            model.isConnecting = false
+            model.isConnected = true
+        }
+        NSAccessibility.post(element: NSApp as Any, notification: .announcementRequested, userInfo: [
+            .announcement: "Connected" + (batteryPercent.map { ", battery \($0) percent" } ?? ""),
+            .priority: NSAccessibilityPriorityLevel.high.rawValue,
+        ])
+    }
+
     func hide() {
         guard model.isVisible else { return }
-        if model.reduceMotion {
-            withAnimation(.easeInOut(duration: 0.2)) {
-                model.isVisible = false
-                model.isDetached = false
-            }
-        } else {
-            // Rise and re-attach to the top edge first, then shrink back into the notch:
-            // smooth, no bounce. Shrinking while still floating would leave a notch-shaped
-            // blob hanging below the menu bar with a gap above it.
-            withAnimation(.smooth(duration: 0.25)) { model.isDetached = false }
-            withAnimation(.smooth(duration: 0.35).delay(0.1)) { model.isVisible = false }
+        let anim: Animation = model.reduceMotion
+            ? .easeInOut(duration: 0.2)
+            : .spring(response: 0.46, dampingFraction: 0.88)
+        withAnimation(anim) {
+            model.isVisible = false
+            model.progress = 0.0
         }
         let item = DispatchWorkItem { [weak self] in self?.panel.orderOut(nil) }
         hideWorkItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.7, execute: item)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: item)
     }
 
     /// Whether the mouse is currently over the pill (screen coordinates, so it works while the
