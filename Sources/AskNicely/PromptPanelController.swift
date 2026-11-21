@@ -40,6 +40,10 @@ final class PromptPanelController {
     /// symmetric, so the exit is the entrance played backwards.
     private static var morphDuration: Double { Double(MorphTuning.shared.duration) }
     private static var morphAnimation: Animation { .linear(duration: morphDuration) }
+    /// Eased out (same starting speed, slowing into the end) and a little longer than the entrance,
+    /// so the absorbed drop settles back into the notch instead of stopping dead.
+    private static var exitDuration: Double { Double(MorphTuning.shared.exitDuration) }
+    private static var exitAnimation: Animation { .timingCurve(0.3, 0.3, 0.6, 1, duration: exitDuration) }
 
     let model = PromptModel()
     private let panel: FloatingPanel
@@ -91,7 +95,7 @@ final class PromptPanelController {
                 self.model.isVisible = true
                 self.model.progress = 1.0
             }
-            // Land with a liquid jiggle: the wobble runs on its own clock, starting as the morph settles.
+            // Land with a subtle stretch-and-return on its own clock, starting while the pill still widens.
             if !self.model.reduceMotion {
                 let t = MorphTuning.shared
                 withAnimation(.linear(duration: Double(MorphTuning.wobbleLength))
@@ -122,20 +126,20 @@ final class PromptPanelController {
 
     func hide() {
         guard model.isVisible else { return }
-        // No wobble on the way out (its value at the end of the clock is ~0, so this doesn't jump).
+        // No settle stretch on the way out (it has returned to ~0 by the end of its clock, so no jump).
         var reset = Transaction()
         reset.disablesAnimations = true
         withTransaction(reset) { model.wobblePhase = 0 }
         let anim: Animation = model.reduceMotion
             ? .easeInOut(duration: 0.25)
-            : Self.morphAnimation
+            : Self.exitAnimation
         withAnimation(anim) {
             model.isVisible = false
             model.progress = 0.0
         }
         let item = DispatchWorkItem { [weak self] in self?.panel.orderOut(nil) }
         hideWorkItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + Self.morphDuration + 0.1, execute: item)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.exitDuration + 0.1, execute: item)
     }
 
     /// Whether the mouse is currently over the pill (screen coordinates, so it works while the

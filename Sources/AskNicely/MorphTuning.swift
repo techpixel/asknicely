@@ -6,36 +6,33 @@ struct MorphTuning {
     static let shared = MorphTuning()
 
     // Timing
-    let duration: CGFloat = 0.48       // seconds, show and hide
-    /// 0 = perfectly uniform speed, 1 = the full pacing curve below (slow drip, quick elsewhere).
-    let paceAmount: CGFloat = 0.1
-    /// Pacing curve: sum of three smoothsteps (lead-in, drip, settle). Weights are fractions of morph
-    /// progress; the settle weight is the remainder, so the three always add up to 1.
-    let leadWeight: CGFloat = 0.2      // morph progress covered by the lead-in
-    let dripWeight: CGFloat = 0.3      // morph progress covered by the drip (0.2 → 0.5)
-    let leadEnd: CGFloat = 0.14        // time fraction where the lead-in ends
-    let dripStart: CGFloat = 0.10
-    let dripEnd: CGFloat = 0.50
-    let settleStart: CGFloat = 0.40
-    let settleEnd: CGFloat = 0.85
-    var settleWeight: CGFloat { max(0, 1 - leadWeight - dripWeight) }
+    let duration: CGFloat = 0.48       // seconds, entrance
+    let exitDuration: CGFloat = 0.58   // seconds, exit (eased out, so it needs a bit longer to settle)
+    /// Pacing: everything moves at an even speed except one smooth slow-down around the neck
+    /// (swell → neck → pinch), so the drip has time to read. 0 = perfectly uniform.
+    let neckSlowdown: CGFloat = 0.8    // how much slower the neck runs (0.8 ≈ 1.8× slower at its centre)
+    let neckCenter: CGFloat = 0.38     // morph progress at the centre of the slow-down (the neck stretch + pinch)
+    let neckWidth: CGFloat = 0.12      // spread of the slow-down, in morph progress
 
     // Shape
     let blendPeak: CGFloat = 26        // neck / fillet size at its widest
     let blendEnd: CGFloat = 6          // blend radius after the pinch (small → clean separation)
-    let pinchStart: CGFloat = 0.28     // morph progress where the neck starts thinning
-    let pinchEnd: CGFloat = 0.55       // morph progress where it has snapped
+    let pinchStart: CGFloat = 0.30     // morph progress where the neck starts thinning
+    let pinchEnd: CGFloat = 0.52       // morph progress where it has snapped
+    let neckMarginStart: CGFloat = 20  // how thick the neck is as it starts thinning
+    let neckMarginEnd: CGFloat = -6    // below 0 = separated (more negative = cleaner break)
     let dip: CGFloat = 12              // how far the drop falls past its resting spot
     let sag: CGFloat = 0               // how far the notch's bottom edge sags (0: the notch stays put)
     let dropStartWidth: CGFloat = 34   // width of the round drop
     let bloomStart: CGFloat = 0.35     // morph progress where the drop starts widening to the capsule
     let notchRadius: CGFloat = 16      // bottom corner radius of the notch body
+    let skirt: CGFloat = 14            // how far the notch's whole bottom edge funnels down into the neck
 
-    // Settle wobble (entrance only)
-    let wobbleAmount: CGFloat = 0.1    // 0 = none; 0.1 ≈ ±8pt wider / ±2pt flatter at the first squash
-    let wobbleFrequency: CGFloat = 3   // oscillations per second
-    let wobbleDecay: CGFloat = 7       // how quickly it dies down
-    let wobbleStart: CGFloat = 0.6     // fraction of the duration at which it starts
-    /// Length of the wobble clock in seconds (long enough for the decay to die out).
-    static let wobbleLength: CGFloat = 0.9
+    // Settle bounce (entrance only): the pill swells once on all sides and eases back, no rebound
+    let bounceAmount: CGFloat = 0.025  // peak sideways scale-up (0.025 ≈ 6pt wider); 0 = none
+    let bounceVertical: CGFloat = 0.35 // top/bottom move this fraction as much (≈ 0.4pt each)
+    let bouncePeakTime: CGFloat = 0.12 // seconds from start to the biggest point
+    let wobbleStart: CGFloat = 0.85    // fraction of the duration at which it starts (as the pill lands)
+    /// Length of the settle clock in seconds (long enough for the bounce to die out).
+    static let wobbleLength: CGFloat = 1.2
 }

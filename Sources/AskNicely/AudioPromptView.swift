@@ -5,7 +5,7 @@ final class PromptModel {
     var isVisible = false
     /// Continuous 0 → 1 progress driving the water-droplet morph out of / back into the notch.
     var progress: CGFloat = 0
-    /// 0 → 1 clock for the liquid settle wobble after the entrance (only animated on show).
+    /// 0 → 1 clock for the settle bounce at the end of the entrance (only animated on show).
     var wobblePhase: CGFloat = 0
     /// Whether active-looking Liquid Glass can be forced (macOS 26+ and the private hooks exist).
     /// When `false` the pill simply stays notch-black.
@@ -231,6 +231,9 @@ private struct LiquidBlobShape: Shape {
     var dropHeight: CGFloat
     /// Smooth-union radius: how far apart the bodies can be and still merge (fillet / neck size).
     var blend: CGFloat
+    /// How far the notch's whole bottom edge bulges down (bell-shaped: 0 at its corners, deepest in
+    /// the middle), so the entire notch funnels into the neck rather than just its centre.
+    var skirt: CGFloat = 0
 
     private static func roundBox(_ px: CGFloat, _ py: CGFloat, cy: CGFloat, hw: CGFloat, hh: CGFloat, r: CGFloat) -> CGFloat {
         let r = min(r, hw, hh)
@@ -241,8 +244,12 @@ private struct LiquidBlobShape: Shape {
 
     private func field(_ x: CGFloat, _ y: CGFloat) -> CGFloat {
         let notchTop: CGFloat = -60
-        let a = Self.roundBox(x, y, cy: (notchTop + notchBottom) / 2, hw: notchHalfWidth,
+        var a = Self.roundBox(x, y, cy: (notchTop + notchBottom) / 2, hw: notchHalfWidth,
                               hh: (notchBottom - notchTop) / 2, r: notchRadius)
+        if skirt > 0 {
+            let u = min(abs(x) / notchHalfWidth, 1)
+            a -= skirt * (1 - u * u) * (1 - u * u)
+        }
         let b = Self.roundBox(x, y, cy: dropTop + dropHeight / 2, hw: dropWidth / 2,
                               hh: dropHeight / 2, r: dropHeight / 2)
         let h = max(blend - abs(a - b), 0) / blend
@@ -251,7 +258,14 @@ private struct LiquidBlobShape: Shape {
 
     func path(in rect: CGRect) -> Path {
         let cx = rect.midX
-        let maxY = min(rect.maxY, max(dropTop + dropHeight, notchBottom) + 2)
+        // Once the drop is farther from the notch than the blend radius, the smooth union no
+        // longer changes it at all, so draw it as an exact capsule: the row-traced outline is
+        // coarse on the capsule's shoulders, and the glass rim shows those kinks as a wiggle.
+        // (Closest notch point is its centre, pushed down by the full skirt.)
+        let gap = dropTop - (notchBottom + skirt)
+        let dropIsExact = gap >= blend
+        let traceBottom = dropIsExact ? notchBottom + skirt + 1 : max(dropTop + dropHeight, notchBottom) + 2
+        let maxY = min(rect.maxY, traceBottom)
         var path = Path()
         var run: [CGPoint] = []
         // Closes the piece traced so far. Rows between separated bodies are empty, so each body
@@ -280,6 +294,11 @@ private struct LiquidBlobShape: Shape {
             y += 0.5
         }
         flush()
+        if dropIsExact {
+            let r = min(dropHeight, dropWidth) / 2   // matches the SDF's capsule (radius = half height)
+            path.addRoundedRect(in: CGRect(x: cx - dropWidth / 2, y: dropTop, width: dropWidth, height: dropHeight),
+                                cornerSize: CGSize(width: r, height: r), style: .circular)
+        }
         return path
     }
 }
@@ -313,25 +332,37 @@ private struct LiquidDropMorphView<Content: View>: View, Animatable {
         return t * t * (3 - 2 * t)
     }
 
-    /// Re-paces linear time into morph progress as a sum of smoothsteps (monotone, no kinks):
-    /// a quick lead-in through the empty first part, a deliberately slow middle that gives the drip
-    /// (swell, neck, pinch: morph progress 0.2 → 0.5) about a third of the duration, then a short settle (done by ~85% of the duration, so there is no slow tail).
+    /// Re-paces linear time `s` into morph progress with one smooth slow-down centred on the neck.
+    /// Time spent per unit of progress is 1 + B·bell(progress) (a Gaussian bump at `neckCenter`), so
+    /// the swell → neck → pinch lingers while everything else runs evenly, with no second burst.
+    /// Elapsed time as a function of progress has a closed form (via erf); invert it by bisection.
     private func pace(_ s: CGFloat) -> CGFloat {
         let t = MorphTuning.shared
-        let paced = t.leadWeight * smoothstep(0, t.leadEnd, s)
-            + t.dripWeight * smoothstep(t.dripStart, t.dripEnd, s)
-            + t.settleWeight * smoothstep(t.settleStart, t.settleEnd, s)
-        return s + t.paceAmount * (paced - s)   // blend between uniform (s) and the paced curve
+        let b = t.neckSlowdown, c = t.neckCenter, w = t.neckWidth
+        guard b > 0 else { return s }
+        let k = b * w * CGFloat.pi.squareRoot() / 2
+        func time(_ q: CGFloat) -> CGFloat { q + k * (erf((q - c) / w) - erf(-c / w)) }
+        let target = s * time(1)
+        var lo: CGFloat = 0, hi: CGFloat = 1
+        for _ in 0..<24 {
+            let mid = (lo + hi) / 2
+            if time(mid) < target { lo = mid } else { hi = mid }
+        }
+        return (lo + hi) / 2
     }
 
     var body: some View {
         let t = MorphTuning.shared
         let p = pace(clamp(progress, 0, 1))
-        // Liquid settle: a damped oscillation of squash (wider, flatter) / stretch (narrower, taller)
-        // on its own clock, so the entrance lands with a jiggle instead of easing to a dead stop.
+        // Settle bounce (entrance only, on its own clock): as the pill lands it swells once and eases
+        // back, x·e^(1−x) with x = τ/peak: it starts moving outward immediately (continuing the
+        // motion), peaks once and returns without rebounding. Mostly sideways; the top and bottom
+        // move only `bounceVertical` as much. The content scales with the smaller (vertical) amount.
         let tau = wobblePhase * MorphTuning.wobbleLength
-        let wobble = t.wobbleAmount * sin(2 * .pi * t.wobbleFrequency * tau) * exp(-t.wobbleDecay * tau)
-        let overshoot = max(0, progress - 1) + wobble
+        let bx = tau / t.bouncePeakTime
+        let bounce = t.bounceAmount * bx * exp(1 - bx)
+        let bounceY = bounce * t.bounceVertical
+        let overshoot = max(0, progress - 1)
         let targetW = AudioPromptView.contentSize.width
         let targetH = AudioPromptView.contentSize.height
         let nw = notchWidth > 0 ? notchWidth : 70
@@ -342,22 +373,41 @@ private struct LiquidDropMorphView<Content: View>: View, Animatable {
         let notchBottom = dripEdgeY - 1 + sag - lift
 
         // Droplet: a round blob that falls from inside the notch, then widens into the capsule.
-        let startTop = dripEdgeY - 20
+        let startTop = dripEdgeY - 17   // just inside the notch, so it starts emerging right away
         let dropT = smoothstep(0.0, 0.8, p)
         let dip = smoothstep(0.05, 0.5, p) * (1 - smoothstep(0.5, 0.95, p)) * t.dip
         // Starts short enough (14pt) to sit entirely inside the notch at p = 0, rounding out to 22pt.
-        let dropH = max(14, 14 + 8 * smoothstep(0, 0.35, p) + (targetH - 22) * smoothstep(0.05, 0.9, p) - overshoot * 18)
-        let dropW = t.dropStartWidth + (targetW - t.dropStartWidth) * smoothstep(t.bloomStart, 1.0, p) + overshoot * 80
-        let dropTop = startTop + (restingY - startTop) * dropT + dip + overshoot * 9
+        let baseH = max(14, 14 + 8 * smoothstep(0, 0.35, p) + (targetH - 22) * smoothstep(0.05, 0.9, p) - overshoot * 18)
+        let dropH = baseH * (1 + bounceY)
+        let dropW = (t.dropStartWidth + (targetW - t.dropStartWidth) * smoothstep(t.bloomStart, 1.0, p) + overshoot * 80)
+            * (1 + bounce)
+        let dropTop = startTop + (restingY - startTop) * dropT + dip + overshoot * 9 - baseH * bounceY / 2
 
+        // The swell, funnel and merge radius all start at p = 0, so the bump under the notch grows
+        // (and on the exit, shrinks) smoothly over the whole first stretch instead of vanishing a
+        // tenth of the way before the end and leaving dead time.
         // Merge radius: tiny while the drop is still hidden (no bulge on the notch), wide as it swells
         // out, then shrinking so the neck thins until surface tension snaps it.
-        let blend = 4 + (t.blendPeak - 4) * smoothstep(0.06, t.pinchStart, p)
-            - (t.blendPeak - t.blendEnd) * smoothstep(t.pinchStart, t.pinchEnd, p)
+        // The notch's whole bottom edge funnels down toward the drop. It holds through the break and
+        // then pulls back up smoothly, like the leftover liquid on a tap, so the notch doesn't snap
+        // flat the instant the neck lets go (the fillet that formed most of the funnel vanishes then).
+        let skirt = t.skirt * smoothstep(0, 0.34, p) * (1 - smoothstep(0.44, 0.66, p))
+        // Merge radius. It first grows so the drop swells out of the notch with soft fillets. Then it
+        // tracks the live gap between notch and drop: the smooth union joins two bodies while
+        // gap < radius / 2, so radius = 2·gap + margin keeps them joined while margin > 0, and the
+        // neck's thickness follows the margin. Shrinking the margin steadily over the pinch window
+        // makes the neck stretch and thin at an even pace, however fast the drop is moving, instead
+        // of snapping the moment the drop outruns a fixed radius. After the pinch it settles small.
+        let rampUp = 4 + (t.blendPeak - 4) * smoothstep(0, 0.28, p)
+        let gap = dropTop - (notchBottom + skirt)
+        let margin = t.neckMarginStart - (t.neckMarginStart - t.neckMarginEnd) * smoothstep(t.pinchStart, t.pinchEnd, p)
+        let tracked = max(4, 2 * gap + margin)
+        let joined = rampUp + (tracked - rampUp) * smoothstep(0.24, 0.34, p)
+        let blend = joined + (t.blendEnd - joined) * smoothstep(t.pinchEnd, t.pinchEnd + 0.12, p)
 
         let shape = LiquidBlobShape(
             notchHalfWidth: nw / 2, notchBottom: notchBottom, notchRadius: t.notchRadius,
-            dropTop: dropTop, dropWidth: dropW, dropHeight: dropH, blend: blend)
+            dropTop: dropTop, dropWidth: dropW, dropHeight: dropH, blend: blend, skirt: skirt)
         let contentProgress = smoothstep(0.55, 1.0, p)
         // Notch-black over the part of the body that overlaps / hangs from the real notch.
         let blackFade = 1 - smoothstep(0.35, 0.65, p)
@@ -366,13 +416,13 @@ private struct LiquidDropMorphView<Content: View>: View, Animatable {
             if #available(macOS 26.0, *), glassAvailable {
                 Color.clear
                     .overlay(alignment: .top) { notchBlack(opacity: blackFade) }
-                    .overlay(alignment: .top) { pill(dropTop: dropTop, w: dropW, h: dropH, contentProgress: contentProgress) }
+                    .overlay(alignment: .top) { pill(dropTop: dropTop, w: dropW, h: dropH, contentProgress: contentProgress, scale: 1 + bounceY) }
                     .clipShape(shape)
                     .glassEffect(.regular, in: shape)
                     .contentShape(shape)
             } else {
                 Color.black
-                    .overlay(alignment: .top) { pill(dropTop: dropTop, w: dropW, h: dropH, contentProgress: contentProgress) }
+                    .overlay(alignment: .top) { pill(dropTop: dropTop, w: dropW, h: dropH, contentProgress: contentProgress, scale: 1 + bounceY) }
                     .clipShape(shape)
                     .shadow(color: .black.opacity(0.45 * Double(p)), radius: 10, y: 4)
                     .contentShape(shape)
@@ -394,9 +444,10 @@ private struct LiquidDropMorphView<Content: View>: View, Animatable {
         .allowsHitTesting(false)
     }
 
-    private func pill(dropTop: CGFloat, w: CGFloat, h: CGFloat, contentProgress: CGFloat) -> some View {
+    private func pill(dropTop: CGFloat, w: CGFloat, h: CGFloat, contentProgress: CGFloat, scale: CGFloat) -> some View {
         content
             .scaleEffect(0.76 + 0.24 * contentProgress, anchor: .top)
+            .scaleEffect(scale)
             .blur(radius: (1 - contentProgress) * 8)
             .opacity(Double(contentProgress))
             .allowsHitTesting(isInteractive)
