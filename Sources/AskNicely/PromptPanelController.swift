@@ -35,6 +35,12 @@ private final class FloatingPanel: NSPanel {
 /// Hosts the prompt in a non-activating floating panel pinned to the top-center of the screen.
 @MainActor
 final class PromptPanelController {
+    /// Show and hide share one timeline, so each takes the same time. It is driven linearly; the
+    /// pacing (quick lead-in, slower drip, settle) lives in `LiquidDropMorphView.pace(_:)`, which is
+    /// symmetric, so the exit is the entrance played backwards.
+    private static var morphDuration: Double { Double(MorphTuning.shared.duration) }
+    private static var morphAnimation: Animation { .linear(duration: morphDuration) }
+
     let model = PromptModel()
     private let panel: FloatingPanel
     private var hideWorkItem: DispatchWorkItem?
@@ -68,6 +74,9 @@ final class PromptPanelController {
         model.wasInteracted = false
         model.reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
         model.onConnect = onConnect
+        model.isVisible = false
+        model.progress = 0.0
+        model.wobblePhase = 0
         positionPanel()
         panel.orderFrontRegardless()
         panel.contentView?.layoutSubtreeIfNeeded()
@@ -76,11 +85,19 @@ final class PromptPanelController {
         // committed initial layout in one continuous liquid motion.
         DispatchQueue.main.async {
             let anim: Animation = self.model.reduceMotion
-                ? .easeInOut(duration: 0.2)
-                : .spring(response: 0.58, dampingFraction: 0.76)
+                ? .easeInOut(duration: 0.25)
+                : Self.morphAnimation
             withAnimation(anim) {
                 self.model.isVisible = true
                 self.model.progress = 1.0
+            }
+            // Land with a liquid jiggle: the wobble runs on its own clock, starting as the morph settles.
+            if !self.model.reduceMotion {
+                let t = MorphTuning.shared
+                withAnimation(.linear(duration: Double(MorphTuning.wobbleLength))
+                    .delay(Self.morphDuration * Double(t.wobbleStart))) {
+                    self.model.wobblePhase = 1
+                }
             }
         }
         // HIG: don't rely on motion alone to communicate. Announce the prompt to VoiceOver users.
@@ -105,16 +122,20 @@ final class PromptPanelController {
 
     func hide() {
         guard model.isVisible else { return }
+        // No wobble on the way out (its value at the end of the clock is ~0, so this doesn't jump).
+        var reset = Transaction()
+        reset.disablesAnimations = true
+        withTransaction(reset) { model.wobblePhase = 0 }
         let anim: Animation = model.reduceMotion
-            ? .easeInOut(duration: 0.2)
-            : .spring(response: 0.46, dampingFraction: 0.88)
+            ? .easeInOut(duration: 0.25)
+            : Self.morphAnimation
         withAnimation(anim) {
             model.isVisible = false
             model.progress = 0.0
         }
         let item = DispatchWorkItem { [weak self] in self?.panel.orderOut(nil) }
         hideWorkItem = item
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6, execute: item)
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.morphDuration + 0.1, execute: item)
     }
 
     /// Whether the mouse is currently over the pill (screen coordinates, so it works while the

@@ -5,6 +5,8 @@ final class PromptModel {
     var isVisible = false
     /// Continuous 0 → 1 progress driving the water-droplet morph out of / back into the notch.
     var progress: CGFloat = 0
+    /// 0 → 1 clock for the liquid settle wobble after the entrance (only animated on show).
+    var wobblePhase: CGFloat = 0
     /// Whether active-looking Liquid Glass can be forced (macOS 26+ and the private hooks exist).
     /// When `false` the pill simply stays notch-black.
     var glassAvailable = false
@@ -73,7 +75,9 @@ struct AudioPromptView: View {
             } else {
                 LiquidDropMorphView(
                     progress: model.progress,
+                    wobblePhase: model.wobblePhase,
                     dripEdgeY: dripEdgeY,
+                    notchWidth: model.hasNotch ? model.notchSize.width : 0,
                     restingY: restingY,
                     glassAvailable: model.glassAvailable,
                     isInteractive: model.isVisible,
@@ -213,22 +217,91 @@ private struct StaticSurfaceModifier<S: InsettableShape>: ViewModifier {
     }
 }
 
-/// Continuously morphs a Liquid Glass water droplet out of (and back into) the notch using
-/// `GlassEffectContainer(spacing:)`'s GPU signed-distance-field smooth union across three elements:
-/// 1. A wetting meniscus anchor tucked inside the bottom edge of the notch,
-/// 2. An hourglass liquid neck stem that stretches across the gap below the notch and snaps/pinches off,
-/// 3. The main droplet bulb that swells out of the notch center and blooms into the full capsule.
+/// One liquid body: the smooth union (polynomial smin of two signed-distance fields) of the notch
+/// and a water droplet, traced row by row into closed outlines. While the two are joined it is one
+/// piece with a neck between them; once they pinch apart each gets its own closed path.
+private struct LiquidBlobShape: Shape {
+    /// Notch body: centered, extends above the screen edge; only its bottom edge matters.
+    var notchHalfWidth: CGFloat
+    var notchBottom: CGFloat
+    var notchRadius: CGFloat
+    /// Droplet / pill: centered horizontally.
+    var dropTop: CGFloat
+    var dropWidth: CGFloat
+    var dropHeight: CGFloat
+    /// Smooth-union radius: how far apart the bodies can be and still merge (fillet / neck size).
+    var blend: CGFloat
+
+    private static func roundBox(_ px: CGFloat, _ py: CGFloat, cy: CGFloat, hw: CGFloat, hh: CGFloat, r: CGFloat) -> CGFloat {
+        let r = min(r, hw, hh)
+        let qx = abs(px) - hw + r
+        let qy = abs(py - cy) - hh + r
+        return hypot(max(qx, 0), max(qy, 0)) + min(max(qx, qy), 0) - r
+    }
+
+    private func field(_ x: CGFloat, _ y: CGFloat) -> CGFloat {
+        let notchTop: CGFloat = -60
+        let a = Self.roundBox(x, y, cy: (notchTop + notchBottom) / 2, hw: notchHalfWidth,
+                              hh: (notchBottom - notchTop) / 2, r: notchRadius)
+        let b = Self.roundBox(x, y, cy: dropTop + dropHeight / 2, hw: dropWidth / 2,
+                              hh: dropHeight / 2, r: dropHeight / 2)
+        let h = max(blend - abs(a - b), 0) / blend
+        return min(a, b) - h * h * blend / 4
+    }
+
+    func path(in rect: CGRect) -> Path {
+        let cx = rect.midX
+        let maxY = min(rect.maxY, max(dropTop + dropHeight, notchBottom) + 2)
+        var path = Path()
+        var run: [CGPoint] = []
+        // Closes the piece traced so far. Rows between separated bodies are empty, so each body
+        // must be its own closed path (joining them would draw a diagonal wedge between them).
+        func flush() {
+            guard let first = run.first else { return }
+            path.move(to: CGPoint(x: cx - first.x, y: first.y))
+            path.addLine(to: CGPoint(x: cx + first.x, y: first.y))
+            for pt in run { path.addLine(to: CGPoint(x: cx + pt.x, y: pt.y)) }
+            for pt in run.reversed() { path.addLine(to: CGPoint(x: cx - pt.x, y: pt.y)) }
+            path.closeSubpath()
+            run.removeAll(keepingCapacity: true)
+        }
+        var y: CGFloat = 0
+        while y <= maxY {
+            if field(0, y) < 0 {
+                var lo: CGFloat = 0, hi = rect.width / 2
+                for _ in 0..<18 {
+                    let mid = (lo + hi) / 2
+                    if field(mid, y) < 0 { lo = mid } else { hi = mid }
+                }
+                run.append(CGPoint(x: lo, y: y))
+            } else {
+                flush()
+            }
+            y += 0.5
+        }
+        flush()
+        return path
+    }
+}
+
+/// Morphs the prompt out of (and back into) the notch as a single water droplet. One progress
+/// value (0 → 1) drives everything: a drop swells out of the notch's bottom edge, hangs from a neck
+/// that thins as surface tension lets go (the blend radius shrinks), pinches off as a round drop,
+/// falls to its resting spot and widens into the capsule. Dismissal plays it in reverse.
 private struct LiquidDropMorphView<Content: View>: View, Animatable {
     var progress: CGFloat
+    var wobblePhase: CGFloat
     let dripEdgeY: CGFloat
+    /// Width of the physical notch (0 → no notch; a small stand-in source is used).
+    let notchWidth: CGFloat
     let restingY: CGFloat
     let glassAvailable: Bool
     let isInteractive: Bool
     let content: Content
 
-    var animatableData: CGFloat {
-        get { progress }
-        set { progress = newValue }
+    var animatableData: AnimatablePair<CGFloat, CGFloat> {
+        get { AnimatablePair(progress, wobblePhase) }
+        set { progress = newValue.first; wobblePhase = newValue.second }
     }
 
     private func clamp(_ x: CGFloat, _ a: CGFloat = 0, _ b: CGFloat = 1) -> CGFloat {
@@ -240,95 +313,94 @@ private struct LiquidDropMorphView<Content: View>: View, Animatable {
         return t * t * (3 - 2 * t)
     }
 
+    /// Re-paces linear time into morph progress as a sum of smoothsteps (monotone, no kinks):
+    /// a quick lead-in through the empty first part, a deliberately slow middle that gives the drip
+    /// (swell, neck, pinch: morph progress 0.2 → 0.5) about a third of the duration, then a short settle (done by ~85% of the duration, so there is no slow tail).
+    private func pace(_ s: CGFloat) -> CGFloat {
+        let t = MorphTuning.shared
+        let paced = t.leadWeight * smoothstep(0, t.leadEnd, s)
+            + t.dripWeight * smoothstep(t.dripStart, t.dripEnd, s)
+            + t.settleWeight * smoothstep(t.settleStart, t.settleEnd, s)
+        return s + t.paceAmount * (paced - s)   // blend between uniform (s) and the paced curve
+    }
+
     var body: some View {
-        let p = clamp(progress, 0, 1)
-        let overshoot = max(0, progress - 1)
+        let t = MorphTuning.shared
+        let p = pace(clamp(progress, 0, 1))
+        // Liquid settle: a damped oscillation of squash (wider, flatter) / stretch (narrower, taller)
+        // on its own clock, so the entrance lands with a jiggle instead of easing to a dead stop.
+        let tau = wobblePhase * MorphTuning.wobbleLength
+        let wobble = t.wobbleAmount * sin(2 * .pi * t.wobbleFrequency * tau) * exp(-t.wobbleDecay * tau)
+        let overshoot = max(0, progress - 1) + wobble
         let targetW = AudioPromptView.contentSize.width
         let targetH = AudioPromptView.contentSize.height
-        let shape = Capsule(style: .continuous)
+        let nw = notchWidth > 0 ? notchWidth : 70
 
-        // Neck extension curve: extends to the notch rim as the droplet bulges out (p = 0.06..0.78),
-        // then snaps back up inside the notch as the liquid neck pinches off (p = 0.64..0.88).
-        let neckIn = smoothstep(0.06, 0.36, p)
-        let neckOut = 1 - smoothstep(0.64, 0.88, p)
-        let neck = neckIn * neckOut
+        // Notch body: sags a little as the drop pulls out, then lifts away once it has pinched off.
+        let sag = smoothstep(0.05, 0.4, p) * (1 - smoothstep(0.5, 0.8, p)) * t.sag
+        let lift = smoothstep(0.40, 0.75, p) * 34
+        let notchBottom = dripEdgeY - 1 + sag - lift
 
-        // 1. Notch wetting meniscus (always stays inside the notch at y_bottom <= dripEdgeY - 1,
-        //    while its SDF blend field curves the shoulders of the emerging droplet into the notch).
-        let anchorW: CGFloat = 56 + 48 * neck
-        let anchorH: CGFloat = 14
-        let anchorBottom: CGFloat = (dripEdgeY - 14) + 13 * neck
+        // Droplet: a round blob that falls from inside the notch, then widens into the capsule.
+        let startTop = dripEdgeY - 20
+        let dropT = smoothstep(0.0, 0.8, p)
+        let dip = smoothstep(0.05, 0.5, p) * (1 - smoothstep(0.5, 0.95, p)) * t.dip
+        // Starts short enough (14pt) to sit entirely inside the notch at p = 0, rounding out to 22pt.
+        let dropH = max(14, 14 + 8 * smoothstep(0, 0.35, p) + (targetH - 22) * smoothstep(0.05, 0.9, p) - overshoot * 18)
+        let dropW = t.dropStartWidth + (targetW - t.dropStartWidth) * smoothstep(t.bloomStart, 1.0, p) + overshoot * 80
+        let dropTop = startTop + (restingY - startTop) * dropT + dip + overshoot * 9
 
-        // 2. Hourglass liquid neck stem bridging the notch rim and the top of the falling droplet.
-        let stemW: CGFloat = 10 + 26 * neck
-        let stemH: CGFloat = 8 + 15 * neck
-        let stemBottom: CGFloat = (dripEdgeY - 14) + 19.5 * neck
+        // Merge radius: tiny while the drop is still hidden (no bulge on the notch), wide as it swells
+        // out, then shrinking so the neck thins until surface tension snaps it.
+        let blend = 4 + (t.blendPeak - 4) * smoothstep(0.06, t.pinchStart, p)
+            - (t.blendPeak - t.blendEnd) * smoothstep(t.pinchStart, t.pinchEnd, p)
 
-        // 3. Main water droplet -> pill:
-        // Surface tension holds the top near the notch initially while the bottom swells out,
-        // then it accelerates through pinch-off and settles at restingY.
-        let dropT = smoothstep(0.04, 0.94, p)
-        let startTop = dripEdgeY - 28   // completely hidden inside the notch (or above screen top) at p = 0
-        let heightT = smoothstep(0.02, 0.62, p)
-        let baseH: CGFloat = 14 + (targetH - 14) * heightT
-
-        // Stays a compact rounded water droplet bulb (56 -> 104pt, narrower than the notch) while
-        // squeezing out of the notch, then blooms horizontally into the 249pt capsule as it detaches.
-        let earlyW: CGFloat = 56 + 48 * smoothstep(0.0, 0.42, p)
-        let bloomT = smoothstep(0.32, 0.98, p)
-        let baseW: CGFloat = earlyW + (targetW - earlyW) * bloomT
-
-        // Volume-conserving liquid squash & stretch when the spring overshoots at rest.
-        let pillW = baseW + overshoot * 80
-        let pillH = max(14, baseH - overshoot * 18)
-        let pillTop = startTop + (restingY - startTop) * dropT + overshoot * 9
-
-        let contentProgress = smoothstep(0.34, 0.92, p)
+        let shape = LiquidBlobShape(
+            notchHalfWidth: nw / 2, notchBottom: notchBottom, notchRadius: t.notchRadius,
+            dropTop: dropTop, dropWidth: dropW, dropHeight: dropH, blend: blend)
+        let contentProgress = smoothstep(0.55, 1.0, p)
+        // Notch-black over the part of the body that overlaps / hangs from the real notch.
+        let blackFade = 1 - smoothstep(0.35, 0.65, p)
 
         Group {
             if #available(macOS 26.0, *), glassAvailable {
-                GlassEffectContainer(spacing: 22) {
-                    ZStack(alignment: .top) {
-                        Color.clear
-                            .frame(width: anchorW, height: anchorH)
-                            .glassEffect(.regular.interactive(), in: shape)
-                            .offset(y: anchorBottom - anchorH)
-                            .allowsHitTesting(false)
-                            .accessibilityHidden(true)
-
-                        Color.clear
-                            .frame(width: stemW, height: stemH)
-                            .glassEffect(.regular.interactive(), in: shape)
-                            .offset(y: stemBottom - stemH)
-                            .allowsHitTesting(false)
-                            .accessibilityHidden(true)
-
-                        dropletPill(shape: shape, pillW: pillW, pillH: pillH, contentProgress: contentProgress)
-                            .glassEffect(.regular.interactive(), in: shape)
-                            .offset(y: pillTop)
-                    }
-                }
+                Color.clear
+                    .overlay(alignment: .top) { notchBlack(opacity: blackFade) }
+                    .overlay(alignment: .top) { pill(dropTop: dropTop, w: dropW, h: dropH, contentProgress: contentProgress) }
+                    .clipShape(shape)
+                    .glassEffect(.regular, in: shape)
+                    .contentShape(shape)
             } else {
-                dropletPill(shape: shape, pillW: pillW, pillH: pillH, contentProgress: contentProgress)
-                    .background(.black, in: shape)
+                Color.black
+                    .overlay(alignment: .top) { pill(dropTop: dropTop, w: dropW, h: dropH, contentProgress: contentProgress) }
+                    .clipShape(shape)
                     .shadow(color: .black.opacity(0.45 * Double(p)), radius: 10, y: 4)
-                    .offset(y: pillTop)
+                    .contentShape(shape)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
     }
 
-    private func dropletPill<S: Shape>(shape: S, pillW: CGFloat, pillH: CGFloat, contentProgress: CGFloat) -> some View {
-        Color.clear
-            .frame(width: pillW, height: pillH)
-            .overlay {
-                content
-                    .scaleEffect(0.76 + 0.24 * contentProgress, anchor: .top)
-                    .blur(radius: (1 - contentProgress) * 8)
-                    .opacity(Double(contentProgress))
-                    .allowsHitTesting(isInteractive)
-            }
-            .clipShape(shape)
-            .contentShape(shape)
+    /// Black down to the notch's bottom edge, fading to clear just below it, so the hanging drop
+    /// emerges from the notch's black instead of starting as grey glass.
+    private func notchBlack(opacity: CGFloat) -> some View {
+        VStack(spacing: 0) {
+            Color.black.frame(height: dripEdgeY + 2)   // always: the body never shows grey over the notch
+            LinearGradient(colors: [.black, .clear], startPoint: .top, endPoint: .bottom)
+                .frame(height: 18)
+                .opacity(Double(opacity))
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .allowsHitTesting(false)
+    }
+
+    private func pill(dropTop: CGFloat, w: CGFloat, h: CGFloat, contentProgress: CGFloat) -> some View {
+        content
+            .scaleEffect(0.76 + 0.24 * contentProgress, anchor: .top)
+            .blur(radius: (1 - contentProgress) * 8)
+            .opacity(Double(contentProgress))
+            .allowsHitTesting(isInteractive)
+            .frame(width: w, height: h)
+            .offset(y: dropTop)
     }
 }
